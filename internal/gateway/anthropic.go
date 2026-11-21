@@ -58,7 +58,17 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		// 建立连接阶段已读出首个数据块，与剩余流合并后再按行解析
 		watched := withWatchdog(io.MultiReader(bytes.NewReader(prefix), resp.Body), resp.Body)
 		defer watched.Stop()
-		scanSSEData(watched.reader, emit)
+		normalEnd := scanSSEDataTracked(watched.reader, emit)
+		if !normalEnd {
+			if s.logger != nil {
+				s.logger.Warn("Gateway", "Anthropic 流式被中断（无 finish_reason/DONE）model=%s", model)
+			}
+			_, _ = w.Write([]byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream interrupted before finish_reason\"}}\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
 		for _, frame := range conv.Finish() {
 			_, _ = w.Write(frame)
 		}

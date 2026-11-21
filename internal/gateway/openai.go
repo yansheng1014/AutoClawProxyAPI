@@ -133,7 +133,17 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		watched := withWatchdog(io.MultiReader(bytes.NewReader(prefix), resp.Body), resp.Body)
 		defer watched.Stop()
-		scanSSEData(watched.reader, emit)
+		normalEnd := scanSSEDataTracked(watched.reader, emit)
+		if !normalEnd {
+			if s.logger != nil {
+				s.logger.Warn("Gateway", "Responses 流式被中断（无 finish_reason/DONE）model=%s", model)
+			}
+			_, _ = w.Write([]byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"upstream_stream_error\",\"message\":\"upstream stream interrupted before finish_reason\"}}\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
 		for _, frame := range conv.Finish() {
 			_, _ = w.Write(frame)
 		}
@@ -183,11 +193,21 @@ func (r *watchdogReader) Read(p []byte) (int, error) {
 // withWatchdog 包装上游响应体：超过 streamIdleTimeout 没有新数据就关闭连接，
 // 让阻塞中的读立即返回，避免客户端无限期等待（表现为“卡住几分钟”）。
 func withWatchdog(r io.Reader, closer io.Closer) *watchedStream {
-	wd := newStreamWatchdog(streamIdleTimeout, func() { _ = closer.Close() })
+	return withWatchdogCallback(r, closer, nil)
+}
+
+// withWatchdogCallback 同上，但允许在超时后先执行回调（用于记录日志、通知客户端），再关闭连接。
+func withWatchdogCallback(r io.Reader, closer io.Closer, onIdle func()) *watchedStream {
+	wd := newStreamWatchdog(streamIdleTimeout, func() {
+		if onIdle != nil {
+			onIdle()
+		}
+		_ = closer.Close()
+	})
 	return &watchedStream{reader: &watchdogReader{r: r, wd: wd}, stop: wd.Stop}
 }
 
-func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, prefix []byte, body io.ReadCloser, _ *accounts.Account) {
+func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, prefix []byte, body io.ReadCloser, acc *accounts.Account) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -196,12 +216,25 @@ func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, prefix []byte, b
 
 	flusher, _ := w.(http.Flusher)
 	stream := io.MultiReader(bytes.NewReader(prefix), body)
-	watched := withWatchdog(stream, body)
+	started := time.Now()
+	watched := withWatchdogCallback(stream, body, func() {
+		if s.logger != nil {
+			s.logger.Warn("Gateway", "上游流式静默超过 %s，主动断开连接（已持续 %s）", streamIdleTimeout, time.Since(started).Round(time.Second))
+		}
+	})
 	defer watched.Stop()
-	reader := bufio.NewReaderSize(watched.reader, 32*1024)
+	reader := bufio.NewReaderSize(watched.reader, 64*1024)
+	// 只有出现过 finish_reason 或 [DONE] 才算正常结束；
+	// 否则（连接被掐断/上游中断）要显式告诉客户端，避免只看到「流结束但没有 finish_reason」。
+	normalEnd := false
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			if bytes.Contains(line, []byte("[DONE]")) {
+				normalEnd = true
+			} else if bytes.Contains(line, []byte("\"finish_reason\"")) && !bytes.Contains(line, []byte("\"finish_reason\":null")) {
+				normalEnd = true
+			}
 			if _, wErr := w.Write(line); wErr != nil {
 				return
 			}
@@ -210,6 +243,23 @@ func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, prefix []byte, b
 			}
 		}
 		if err != nil {
+			if !normalEnd && err != io.EOF {
+				// 连接被中断：补一个标准错误事件，客户端可据此重试
+				_, _ = w.Write([]byte("data: {\"error\":{\"message\":\"upstream stream interrupted before finish_reason\",\"type\":\"upstream_stream_error\",\"code\":\"stream_interrupted\"}}\n\n"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			if !normalEnd {
+				label := "unknown"
+				if acc != nil {
+					label = acc.Cred.DisplayLabel()
+				}
+				if s.logger != nil {
+					s.logger.Warn("Gateway", "上游流式异常结束（无 finish_reason/DONE）账号=[%s] 已持续=%s 原因=%v",
+						label, time.Since(started).Round(time.Millisecond), err)
+				}
+			}
 			return
 		}
 	}
@@ -298,9 +348,12 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 // 流式响应的看门狗参数：
 //   - firstChunkTimeout：上游返回 200 后迟迟不出第一个数据块，视为该出口不可用，直接切号重试
 //   - streamIdleTimeout：流式过程中长时间没有新数据（上游卡死/连接被中间设备黑洞），主动断开
-const (
+//
+// 长思考模型可能几十秒不吐字，静默阈值过小会误杀正常的长时间推理，
+// 这里给到 5 分钟；真正的「上游已死」由 TCP 层与客户端超时兜底。
+var (
 	firstChunkTimeout = 45 * time.Second
-	streamIdleTimeout = 90 * time.Second
+	streamIdleTimeout = 5 * time.Minute
 )
 
 // errFirstChunkTimeout 表示等待上游首包超时。
@@ -515,6 +568,20 @@ func (s *Server) pickNextAccount(targets []accounts.RouteTarget, exclude map[str
 }
 
 // scanSSEData 逐行读取上游 SSE 数据流并回调每条 data 载荷。
+// scanSSEDataTracked 与 scanSSEData 相同，但额外报告上游是否正常结束
+// （出现过 finish_reason 或 [DONE]），用于识别连接被中途掐断的情况。
+func scanSSEDataTracked(body io.Reader, onData func([]byte) bool) bool {
+	normalEnd := false
+	scanSSEData(body, func(data []byte) bool {
+		if bytes.Contains(data, []byte("[DONE]")) ||
+			(bytes.Contains(data, []byte("\"finish_reason\"")) && !bytes.Contains(data, []byte("\"finish_reason\":null"))) {
+			normalEnd = true
+		}
+		return onData(data)
+	})
+	return normalEnd
+}
+
 func scanSSEData(body io.Reader, onData func([]byte) bool) {
 	reader := bufio.NewReaderSize(body, 64*1024)
 	for {
