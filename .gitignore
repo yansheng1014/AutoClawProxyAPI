@@ -31,3 +31,8 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# 订阅原始配置（含节点凭证，禁止入库）
+红魔馆网络.yaml
+source-subscription.yaml
+*.subscription.yaml

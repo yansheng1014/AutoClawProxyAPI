@@ -97,7 +97,9 @@ GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o au
   },
   "checkin": {
     "enabled": true,
-    "time": "08:30"
+    "time": "08:30",
+    "window_start": "08:00",
+    "window_end": "11:30"
   },
   "routing": {
     "prefix_mode": "both",
@@ -112,6 +114,8 @@ GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o au
 - `auth_dir`：账号凭证目录，支持自动扫描 `autoclawcn-*.json` 与 `autoclawglobal-*.json`。
 - `data_dir`：运行态数据目录，用于保存代理池配置（`proxypool.json`）与签到历史（`checkin_history.json`）。
 - `routing`：`prefix_mode` 支持 `both` / `bare` / `prefixed`；`aliases` 支持将同一别名映射到单个或多个目标模型实现自动跨区负载均衡。
+- `checkin`：`window_start` / `window_end` 定义每日随机签到时段（本地时区，默认 `08:00`–`11:30`）。每天按日期确定性随机一个时刻触发（同一天重启不重掷、跨天自动换），多账号会打乱顺序并插入 20–150 秒随机间隔，避免固定时刻 + 同秒批量上报的脚本化特征；未配置时段时回落到 `time` 的固定时刻。进程时区建议设为与出口节点一致（如香港家宽节点用 `TZ=Asia/Hong_Kong`）。
+- 代理测活默认使用明文 HTTP 的 `http://www.gstatic.com/generate_204` 标准 204 测法（连续 3 次采样取最小延迟），可在控制台「代理」页修改测活地址与间隔。
 
 ---
 

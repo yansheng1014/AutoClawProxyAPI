@@ -75,10 +75,11 @@ type HealthConfig struct {
 }
 
 // DefaultHealthConfig 返回默认测活配置。
+// 使用明文 HTTP 的 generate_204 作为标准 204 测法：省去 TLS 握手开销，得到的才是节点真实网络延迟。
 func DefaultHealthConfig() HealthConfig {
 	return HealthConfig{
 		Enabled:     true,
-		URL:         "https://www.gstatic.com/generate_204",
+		URL:         "http://www.gstatic.com/generate_204",
 		IntervalSec: 60,
 		TimeoutSec:  10,
 	}

@@ -745,27 +745,54 @@ func (m *Manager) ProbeNode(ctx context.Context, id string) (*NodeView, error) {
 		},
 	}
 
-	req, errReq := http.NewRequestWithContext(probeCtx, http.MethodGet, hc.URL, nil)
-	if errReq != nil {
-		m.recordProbeResult(id, false, 0, "构造探测请求失败: "+errReq.Error())
+	// 标准 204 测法：明文 HTTP 请求 generate_204，取 TTFB 作为延迟。
+	// 连续采样 probeSamples 次取最小值，避免单次抖动把健康节点误判为不可用。
+	const probeSamples = 3
+	var (
+		bestLatency int64 = -1
+		lastErr     error
+		lastStatus  int
+	)
+	for i := 0; i < probeSamples; i++ {
+		req, errReq := http.NewRequestWithContext(probeCtx, http.MethodGet, hc.URL, nil)
+		if errReq != nil {
+			m.recordProbeResult(id, false, 0, "构造探测请求失败: "+errReq.Error())
+			return m.findNodeView(id)
+		}
+		// 使用常见客户端 UA，避免暴露探针特征
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Connection", "keep-alive")
+
+		start := time.Now()
+		resp, errDo := client.Do(req)
+		latency := time.Since(start).Milliseconds()
+		if errDo != nil {
+			lastErr = errDo
+			continue
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		lastStatus = resp.StatusCode
+		lastErr = nil
+		if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+			if bestLatency < 0 || latency < bestLatency {
+				bestLatency = latency
+			}
+		}
+		if probeCtx.Err() != nil {
+			break
+		}
+	}
+
+	if bestLatency >= 0 {
+		m.recordProbeResult(id, true, bestLatency, "")
 		return m.findNodeView(id)
 	}
-	req.Header.Set("User-Agent", "AutoClaw2API-HealthProbe/1.0")
-
-	start := time.Now()
-	resp, errDo := client.Do(req)
-	latency := time.Since(start).Milliseconds()
-	if errDo != nil {
-		m.recordProbeResult(id, false, latency, errDo.Error())
-		return m.findNodeView(id)
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	_ = resp.Body.Close()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-		m.recordProbeResult(id, true, latency, "")
+	if lastErr != nil {
+		m.recordProbeResult(id, false, 0, lastErr.Error())
 	} else {
-		m.recordProbeResult(id, false, latency, fmt.Sprintf("探测目标返回 HTTP %d", resp.StatusCode))
+		m.recordProbeResult(id, false, 0, fmt.Sprintf("探测目标返回 HTTP %d", lastStatus))
 	}
 	return m.findNodeView(id)
 }

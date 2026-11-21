@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -157,17 +159,47 @@ func (e *Engine) Start(ctx context.Context) {
 	}()
 }
 
+// dailyCheckinTarget 计算「当天」的自动签到目标时刻。
+//
+// 若配置了 checkin.window_start / window_end 时段，则以日期作为确定性随机种子，
+// 在该时段内随机取一个时刻（同一天内重启不会重掷，跨天自动换一个时刻），
+// 从而避免每天固定 HH:MM:00 触发这种明显的脚本化特征；
+// 未配置时段时退化为 checkin.time 的固定时刻。
+func (e *Engine) dailyCheckinTarget(now time.Time) (time.Time, bool) {
+	cfg := e.cfgMgr.Get()
+	if !cfg.Checkin.Enabled {
+		return time.Time{}, false
+	}
+	loc := now.Location()
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+
+	if start, end, ok := cfg.Checkin.CheckinWindow(); ok {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(day.Format("2006-01-02")))
+		_, _ = h.Write([]byte("|autoclaw2api-daily-checkin|"))
+		sum := h.Sum32()
+		offsetMin := int(sum % uint32(end-start))
+		offsetSec := int((sum >> 8) % 60)
+		return day.Add(time.Duration(start+offsetMin)*time.Minute + time.Duration(offsetSec)*time.Second), true
+	}
+
+	if min, ok := config.ParseHHMM(cfg.Checkin.Time); ok {
+		return day.Add(time.Duration(min) * time.Minute), true
+	}
+	return time.Time{}, false
+}
+
 func (e *Engine) maybeRunDailyCheckin(ctx context.Context) {
 	cfg := e.cfgMgr.Get()
 	if !cfg.Checkin.Enabled {
 		return
 	}
 	now := time.Now()
-	today := now.Format("2006-01-02")
-	currentHHMM := now.Format("15:04")
-	if currentHHMM < cfg.Checkin.Time {
+	target, ok := e.dailyCheckinTarget(now)
+	if !ok || now.Before(target) {
 		return
 	}
+	today := now.Format("2006-01-02")
 
 	e.mu.Lock()
 	if e.lastAutoDay == today || e.runningCheckin {
@@ -178,10 +210,15 @@ func (e *Engine) maybeRunDailyCheckin(ctx context.Context) {
 	e.mu.Unlock()
 
 	if e.logger != nil {
-		e.logger.Info("Checkin", "到达每日自动签到时间（%s），开始执行全量签到任务", cfg.Checkin.Time)
+		if start, end, hasWin := cfg.Checkin.CheckinWindow(); hasWin {
+			e.logger.Info("Checkin", "今日随机签到时刻 %s 已到（时段 %02d:%02d-%02d:%02d），开始执行全量签到",
+				target.Format("15:04:05"), start/60, start%60, end/60, end%60)
+		} else {
+			e.logger.Info("Checkin", "到达每日自动签到时间（%s），开始执行全量签到任务", cfg.Checkin.Time)
+		}
 	}
 	go func() {
-		runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		runCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 		defer cancel()
 		e.CheckinAll(runCtx, "auto")
 	}()
@@ -397,10 +434,30 @@ func (e *Engine) CheckinAll(ctx context.Context, source string) []CheckinRecord 
 	}()
 
 	list := e.pool.AllAccounts()
-	results := make([]CheckinRecord, 0, len(list))
+	// 自动签到：打乱账号顺序并加入随机间隔，避免多账号在同一秒内连续上报
+	candidates := make([]accounts.Account, 0, len(list))
 	for _, acc := range list {
 		if acc.Cred.Disabled || acc.SessionDead {
 			continue
+		}
+		candidates = append(candidates, acc)
+	}
+	if source == "auto" && len(candidates) > 1 {
+		rand.Shuffle(len(candidates), func(i, j int) {
+			candidates[i], candidates[j] = candidates[j], candidates[i]
+		})
+	}
+
+	results := make([]CheckinRecord, 0, len(candidates))
+	for i, acc := range candidates {
+		if source == "auto" && i > 0 {
+			// 每号之间 20~150 秒随机间隔
+			gap := time.Duration(20+rand.Intn(131)) * time.Second
+			select {
+			case <-ctx.Done():
+				return results
+			case <-time.After(gap):
+			}
 		}
 		rec := e.CheckinAccount(ctx, acc.ID, source)
 		results = append(results, rec)

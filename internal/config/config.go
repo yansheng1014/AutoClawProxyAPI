@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -129,7 +130,39 @@ type RetryConfig struct {
 // CheckinConfig 定义每日定时自动签到参数。
 type CheckinConfig struct {
 	Enabled bool   `json:"enabled"`
-	Time    string `json:"time"` // 24 小时制 HH:MM
+	Time    string `json:"time"` // 24 小时制 HH:MM，未配置随机窗口时的固定时刻（兼容旧配置）
+	// WindowStart / WindowEnd 定义每日随机签到的时段（本地时区 HH:MM）。
+	// 配置后每天在该时段内按日期确定性随机一个时刻执行，避免固定时刻的脚本化特征。
+	WindowStart string `json:"window_start"`
+	WindowEnd   string `json:"window_end"`
+}
+
+// ParseHHMM 解析 "HH:MM" 为当日分钟数（0-1439）。
+func ParseHHMM(v string) (int, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	parts := strings.SplitN(v, ":", 2)
+	if len(parts) != 2 {
+		return 0, false
+	}
+	h, errH := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, errM := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errH != nil || errM != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
+}
+
+// CheckinWindow 返回生效的随机签到时段（分钟数，起 < 止）；未配置时返回 false。
+func (c CheckinConfig) CheckinWindow() (int, int, bool) {
+	start, okS := ParseHHMM(c.WindowStart)
+	end, okE := ParseHHMM(c.WindowEnd)
+	if !okS || !okE || end <= start {
+		return 0, 0, false
+	}
+	return start, end, true
 }
 
 // RoutingConfig 定义模型发现、别名与启停路由策略。
@@ -155,8 +188,10 @@ func Default() Config {
 			LongCooldownSec:  1800,
 		},
 		Checkin: CheckinConfig{
-			Enabled: true,
-			Time:    "08:30",
+			Enabled:     true,
+			Time:        "08:30",
+			WindowStart: "08:00",
+			WindowEnd:   "11:30",
 		},
 		Routing: RoutingConfig{
 			PrefixMode:     "both",
@@ -188,6 +223,25 @@ func (c *Config) Normalize() {
 		c.LogLevel = def.LogLevel
 	}
 	c.PanelAuth.PasswordHash = strings.TrimSpace(c.PanelAuth.PasswordHash)
+	// 签到时刻与随机窗口规范化：窗口非法时回落为固定时刻
+	c.Checkin.Time = strings.TrimSpace(c.Checkin.Time)
+	if c.Checkin.Time == "" {
+		c.Checkin.Time = def.Checkin.Time
+	}
+	if _, ok := ParseHHMM(c.Checkin.Time); !ok {
+		c.Checkin.Time = def.Checkin.Time
+	}
+	c.Checkin.WindowStart = strings.TrimSpace(c.Checkin.WindowStart)
+	c.Checkin.WindowEnd = strings.TrimSpace(c.Checkin.WindowEnd)
+	if start, okS := ParseHHMM(c.Checkin.WindowStart); okS {
+		if end, okE := ParseHHMM(c.Checkin.WindowEnd); okE && end > start {
+			// 合法窗口，保留
+		} else {
+			c.Checkin.WindowStart, c.Checkin.WindowEnd = "", ""
+		}
+	} else {
+		c.Checkin.WindowStart, c.Checkin.WindowEnd = "", ""
+	}
 
 	// 规范化 API Key 列表并按密钥去重
 	cleanKeys := make([]APIKeyItem, 0, len(c.APIKeys))
