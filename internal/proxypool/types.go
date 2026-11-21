@@ -143,9 +143,9 @@ type ImportSummary struct {
 
 // RouteInfo 描述某个账号最终解析出的出口说明（供账号列表展示与日志追踪）。
 type RouteInfo struct {
-	AccountMode   string `json:"account_mode"`             // inherit | direct | pool | fixed
+	AccountMode   string `json:"account_mode"` // inherit | direct | pool | fixed
 	AccountNodeID string `json:"account_proxy_id,omitempty"`
-	EffectiveMode string `json:"effective_mode"`           // direct | pool | fixed
+	EffectiveMode string `json:"effective_mode"` // direct | pool | fixed
 	NodeID        string `json:"node_id,omitempty"`
 	NodeName      string `json:"node_name,omitempty"`
 	NodeMaskedURL string `json:"node_masked_url,omitempty"`

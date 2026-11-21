@@ -22,14 +22,16 @@ const asciiLogo = `  █████╗ ██╗   ██╗██████�
 
 // Info 描述启动横幅中展示的动态运行状态。
 type Info struct {
-	ListenAddr     string
-	Port           string
-	ReadyTotal     int
-	ReadyCN        int
-	ReadyGlobal    int
-	CheckinEnabled bool
-	CheckinTime    string
-	Version        string
+	ListenAddr      string
+	Port            string
+	ReadyTotal      int
+	ReadyCN         int
+	ReadyGlobal     int
+	CheckinEnabled  bool
+	CheckinTime     string
+	CheckinWinStart string
+	CheckinWinEnd   string
+	Version         string
 }
 
 // Render 渲染完整的绿色 ANSI 启动横幅文本。
@@ -45,11 +47,17 @@ func Render(info Info) string {
 
 	checkinText := "未开启"
 	if info.CheckinEnabled {
-		t := strings.TrimSpace(info.CheckinTime)
-		if t == "" {
-			t = "08:30"
+		ws := strings.TrimSpace(info.CheckinWinStart)
+		we := strings.TrimSpace(info.CheckinWinEnd)
+		if ws != "" && we != "" {
+			checkinText = fmt.Sprintf("已开启（每日随机 %s–%s）", ws, we)
+		} else {
+			t := strings.TrimSpace(info.CheckinTime)
+			if t == "" {
+				t = "08:30"
+			}
+			checkinText = fmt.Sprintf("已开启（每日 %s）", t)
 		}
-		checkinText = fmt.Sprintf("已开启（每日 %s）", t)
 	}
 
 	rows := [][2]string{

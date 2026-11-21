@@ -665,7 +665,7 @@ footer{
                   <th>掩码地址</th>
                   <th>健康状态</th>
                   <th>延迟</th>
-                  <th>绑定账号数</th>
+                  <th>固定绑定</th>
                   <th>操作</th>
                 </tr>
               </thead>
@@ -747,6 +747,11 @@ footer{
             </label>
             <span class="dim">执行时间：</span>
             <input type="time" id="ciTime" value="08:30">
+            <span class="dim">随机时段：</span>
+            <input type="time" id="ciWinStart" value="08:00" title="每天在该时段内确定性随机一个时刻签到（跨天自动换）；留空则按固定时刻">
+            <span class="dim">–</span>
+            <input type="time" id="ciWinEnd" value="11:30" title="时段结束，需晚于开始时刻；留空则按固定时刻">
+            <span class="dim" id="ciTodayHint"></span>
             <button class="btn primary" onclick="saveCheckinConfig()">保存签到计划</button>
           </div>
         </div>
@@ -1306,7 +1311,9 @@ async function loadOverview(){
     document.getElementById('stOtherStates').textContent = `冷却 ${st.cooldown||0} · 停用 ${st.disabled||0} · 失效 ${st.dead||0}`;
     document.getElementById('stBalance').textContent = Math.round(st.total_balance || 0).toLocaleString();
     document.getElementById('stProxyCnt').textContent = `${ps.healthy||0} / ${ps.total||0}`;
-    document.getElementById('stCheckin').textContent = d.checkin && d.checkin.enabled ? `自动签到：每日 ${d.checkin.time}` : '自动签到：未开启';
+    const ck = d.checkin || {};
+    document.getElementById('stCheckin').textContent = !ck.enabled ? '自动签到：未开启'
+      : (ck.window_start && ck.window_end ? `自动签到：每日随机 ${ck.window_start}–${ck.window_end}` : `自动签到：每日 ${ck.time || '08:30'}`);
     document.getElementById('stUptime').textContent = `启动于 ${d.started_at} · 监听 ${d.listen}`;
     document.getElementById('sbSummary').textContent = `在线 ${st.ready_total||0}/${st.total||0} · 代理 ${ps.healthy||0}/${ps.total||0} · 积分 ${Math.round(st.total_balance||0)}`;
 
@@ -1485,7 +1492,8 @@ async function loadProxies(){
     }
     tbody.innerHTML = cachedProxies.map(n => {
       const lat = n.checked_at ? (n.status === 'healthy' ? `<span class="ok">${n.latency_ms} ms</span>` : '<span class="err">—</span>') : '<span class="dim">—</span>';
-      const boundLabel = n.bound_count + (n.bound_regions && n.bound_regions.length ? ` (+区域:${n.bound_regions.join(',')})` : '');
+      const boundRegions = n.bound_regions && n.bound_regions.length ? ` (+区域:${n.bound_regions.join(',')})` : '';
+      const boundLabel = n.bound_count > 0 ? (n.bound_count + boundRegions) : `<span class="dim" title="pool 模式按账号哈希自动分配节点，见「账号」页出口绑定">未固定（池调度）</span>`;
       return `<tr>
         <td>
           <div class="hl">${esc(n.name)}</div>
@@ -1757,6 +1765,9 @@ async function loadCheckinHistory(){
     if (d.config){
       document.getElementById('ciEnabled').checked = !!d.config.enabled;
       document.getElementById('ciTime').value = d.config.time || '08:30';
+      document.getElementById('ciWinStart').value = d.config.window_start || '';
+      document.getElementById('ciWinEnd').value = d.config.window_end || '';
+      updateCheckinHint(d.config);
     }
     const list = d.history || [];
     const tbody = document.getElementById('checkinTbody');
@@ -1780,11 +1791,42 @@ async function loadCheckinHistory(){
   } catch(e){ if (!String(e.message).includes('登录')) toast('加载签到历史失败: ' + e.message, true); }
 }
 
+function fnv32a(str){
+  let h = 0x811c9dc5;
+  for (let i=0;i<str.length;i++){
+    h ^= str.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+function updateCheckinHint(cfg){
+  const el = document.getElementById('ciTodayHint');
+  if (!el) return;
+  try {
+    const ws = cfg && cfg.window_start, we = cfg && cfg.window_end;
+    if (!ws || !we) { el.textContent = ''; return; }
+    const toMin = v => { const [h,m] = v.split(':').map(x=>parseInt(x,10)); return h*60+m; };
+    const start = toMin(ws), end = toMin(we);
+    if (!(end > start)) { el.textContent = '(时段无效，将按固定时刻)'; return; }
+    const day = new Date(); day.setHours(0,0,0,0);
+    const key = day.getFullYear()+'-'+String(day.getMonth()+1).padStart(2,'0')+'-'+String(day.getDate()).padStart(2,'0');
+    const sum = fnv32a(key + '|autoclaw2api-daily-checkin|');
+    const offMin = sum % (end-start);
+    const offSec = Math.floor((sum / 256) % 60);
+    const t = new Date(day.getTime() + (start+offMin)*60000 + offSec*1000);
+    const hh = String(t.getHours()).padStart(2,'0'), mm = String(t.getMinutes()).padStart(2,'0'), ss = String(t.getSeconds()).padStart(2,'0');
+    el.textContent = `(今日 ${hh}:${mm}:${ss})`;
+  } catch(e) { el.textContent = ''; }
+}
 async function saveCheckinConfig(){
   try{
     const enabled = document.getElementById('ciEnabled').checked;
     const time = document.getElementById('ciTime').value || '08:30';
-    const res = await apiFetch('/api/admin/settings', { method:'PUT', body:JSON.stringify({ checkin:{ enabled, time } }) });
+    const ws = document.getElementById('ciWinStart').value.trim();
+    const we = document.getElementById('ciWinEnd').value.trim();
+    const checkin = { enabled, time };
+    if (ws && we) { checkin.window_start = ws; checkin.window_end = we; }
+    const res = await apiFetch('/api/admin/settings', { method:'PUT', body:JSON.stringify({ checkin }) });
     toast(res.message);
     await loadOverview();
   } catch(e){ toast(e.message, true); }
@@ -2159,7 +2201,7 @@ const CLI_COMMANDS = {
     const s = await apiFetch('/api/admin/proxies');
     const list = s.nodes || [];
     if (!list.length){ cliPrint('<span class="dim">代理池暂无节点</span>'); return; }
-    cliPrint(list.map(n => `${renderProxyStatusDot(n)} <span class="hl">${esc(n.name)}</span> (${esc(n.masked_url)}) 延迟:${n.latency_ms}ms 绑定:${n.bound_count}`).join('<br>'));
+    cliPrint(list.map(n => `${renderProxyStatusDot(n)} <span class="hl">${esc(n.name)}</span> (${esc(n.masked_url)}) 延迟:${n.latency_ms}ms 固定:${n.bound_count}`).join('<br>'));
   },
   async apikeys(){
     const d = await apiFetch('/api/admin/apikeys');

@@ -71,14 +71,16 @@ func main() {
 	proxySnap := proxyMgr.Snapshot()
 	port := cfg.ListenPort()
 	banner.Print(os.Stdout, banner.Info{
-		ListenAddr:     cfg.Listen,
-		Port:           port,
-		ReadyTotal:     stats.ReadyTotal,
-		ReadyCN:        stats.ReadyCN,
-		ReadyGlobal:    stats.ReadyGlobal,
-		CheckinEnabled: cfg.Checkin.Enabled,
-		CheckinTime:    cfg.Checkin.Time,
-		Version:        config.Version,
+		ListenAddr:      cfg.Listen,
+		Port:            port,
+		ReadyTotal:      stats.ReadyTotal,
+		ReadyCN:         stats.ReadyCN,
+		ReadyGlobal:     stats.ReadyGlobal,
+		CheckinEnabled:  cfg.Checkin.Enabled,
+		CheckinTime:     cfg.Checkin.Time,
+		CheckinWinStart: cfg.Checkin.WindowStart,
+		CheckinWinEnd:   cfg.Checkin.WindowEnd,
+		Version:         config.Version,
 	})
 
 	logger.Info("Startup", "版本: %s | 配置文件: %s | 凭据目录: %s", config.Version, cfgMgr.Path(), cfg.AuthDir)

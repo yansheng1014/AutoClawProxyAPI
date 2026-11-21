@@ -651,7 +651,11 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 
 	if s.logger != nil {
 		s.logger.SetLevel(updated.LogLevel)
-		s.logger.Info("Admin", "系统配置已更新（日志级别=%s，自动签到=%v %s）", updated.LogLevel, updated.Checkin.Enabled, updated.Checkin.Time)
+		checkinDesc := updated.Checkin.Time
+		if updated.Checkin.WindowStart != "" && updated.Checkin.WindowEnd != "" {
+			checkinDesc = fmt.Sprintf("随机 %s–%s", updated.Checkin.WindowStart, updated.Checkin.WindowEnd)
+		}
+		s.logger.Info("Admin", "系统配置已更新（日志级别=%s，自动签到=%v %s）", updated.LogLevel, updated.Checkin.Enabled, checkinDesc)
 	}
 
 	msg := "配置已保存并立即生效"
