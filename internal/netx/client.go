@@ -101,7 +101,7 @@ func buildTransport(proxyStr string) (*http.Transport, error) {
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       90 * time.Second,
+		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}

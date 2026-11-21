@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,9 +137,11 @@ func (e *Engine) Start(ctx context.Context) {
 		syncTicker := time.NewTicker(30 * time.Second)
 		refreshTicker := time.NewTicker(15 * time.Minute)
 		modelTicker := time.NewTicker(30 * time.Minute)
+		warmTicker := time.NewTicker(45 * time.Second)
 		defer syncTicker.Stop()
 		defer refreshTicker.Stop()
 		defer modelTicker.Stop()
+		defer warmTicker.Stop()
 
 		for {
 			select {
@@ -148,6 +153,10 @@ func (e *Engine) Start(ctx context.Context) {
 				}
 				e.router.PruneInactiveRegions()
 				e.maybeRunDailyCheckin(ctx)
+			case <-warmTicker.C:
+				// 保活上游连接：经代理的连接空闲后会断，重建要付 TCP+TLS+隧道建立
+				// 的代价（实测冷启动首包比热连接慢 3~6 倍），这里用极轻量的请求维持热连接。
+				e.keepWarmTransports(ctx)
 			case <-refreshTicker.C:
 				e.refreshExpiringTokens(ctx)
 			case <-modelTicker.C:
@@ -157,6 +166,54 @@ func (e *Engine) Start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// keepWarmTransports 周期性对每个可用账号的上游基址发起一次极轻量请求，
+// 保持「网关 -> 代理节点 -> 上游」整条链路的 TCP/TLS 连接处于热态。
+// 该请求不携带任何业务参数、不消耗额度，仅用于避免冷连接带来的首包延迟。
+func (e *Engine) keepWarmTransports(ctx context.Context) {
+	cfg := e.cfgMgr.Get()
+	list := e.pool.AllAccounts()
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for _, acc := range list {
+		if acc.Cred.Disabled || acc.SessionDead {
+			continue
+		}
+		region := protocol.NormalizeRegion(string(acc.Cred.Region))
+		override := cfg.Upstream.GlobalBaseURL
+		if !region.IsGlobal() {
+			override = cfg.Upstream.CNBaseURL
+		}
+		baseURL := protocol.ResolveBaseURL(region, override)
+		if strings.TrimSpace(baseURL) == "" {
+			continue
+		}
+		client, err := e.proxyMgr.ClientForAccount(acc.ID, string(region), 8*time.Second)
+		if err != nil {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(url string, accID string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("User-Agent", "okhttp/4.12.0")
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+			_ = resp.Body.Close()
+		}(baseURL, acc.ID)
+	}
+	wg.Wait()
 }
 
 // dailyCheckinTarget 计算「当天」的自动签到目标时刻。

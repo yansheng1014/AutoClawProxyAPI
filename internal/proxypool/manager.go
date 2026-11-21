@@ -597,7 +597,19 @@ func (m *Manager) DescribeAccountRoute(accountID, region string) RouteInfo {
 	case ModeDirect:
 		info.Summary = prefix + "直连"
 	case ModePool:
-		info.Summary = prefix + "代理池自动分配"
+		// 池模式下按与请求一致的账号哈希解析当前亲和节点，让控制台能看到实际出口
+		if node, found := m.pickPoolNodeLocked(accountID); found {
+			info.NodeID = node.ID
+			info.NodeName = node.Name
+			info.NodeMaskedURL = MaskProxyURL(node.URL)
+			tag := ""
+			if h := m.health[node.ID]; h != nil && h.Status == StatusUnhealthy {
+				tag = "（该节点暂不可用，下次请求自动换节点）"
+			}
+			info.Summary = fmt.Sprintf("%s代理池自动分配 → 当前节点：%s%s", prefix, node.Name, tag)
+		} else {
+			info.Summary = prefix + "代理池自动分配（暂无可用节点）"
+		}
 	case ModeFixed:
 		if node, found := m.findNodeLocked(eff.ProxyID); found {
 			info.NodeID = node.ID
@@ -675,6 +687,42 @@ func (m *Manager) resolveTransport(accountID, region string) (*http.Transport, e
 	}
 }
 
+// fastSubsetLocked 从候选节点中挑出「延迟接近最快」的子集。
+// 判定标准：延迟 <= 最快延迟*1.5 + 80ms（未知延迟的节点视为可用，避免刚启动时无节点可选）。
+// 返回 nil 表示无法判定（没有有效延迟数据），由调用方沿用原候选集合。
+func (m *Manager) fastSubsetLocked(pool []Node) []Node {
+	var (
+		minLatency int64 = -1
+		out              = make([]Node, 0, len(pool))
+	)
+	for _, n := range pool {
+		h := m.health[n.ID]
+		if h == nil || h.LatencyMS <= 0 {
+			continue
+		}
+		if minLatency < 0 || h.LatencyMS < minLatency {
+			minLatency = h.LatencyMS
+		}
+	}
+	if minLatency < 0 {
+		return nil
+	}
+	threshold := minLatency*3/2 + 80
+	for _, n := range pool {
+		h := m.health[n.ID]
+		if h == nil || h.LatencyMS <= 0 {
+			continue
+		}
+		if h.LatencyMS <= threshold {
+			out = append(out, n)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func (m *Manager) pickPoolNodeLocked(accountID string) (Node, bool) {
 	var healthy []Node
 	var fallback []Node
@@ -695,6 +743,11 @@ func (m *Manager) pickPoolNodeLocked(accountID string) (Node, bool) {
 	}
 	if len(pool) == 0 {
 		return Node{}, false
+	}
+	// 延迟感知：只在「接近最快」的健康节点集合里做亲和映射，
+	// 避免账号被稳定哈希钉死到明显更慢的节点上（实测可差 150ms 以上）。
+	if fast := m.fastSubsetLocked(pool); len(fast) > 0 {
+		pool = fast
 	}
 	// 对有账号 ID 的请求优先按稳定哈希亲和映射同一健康节点，无账号 ID 时轮询
 	if accountID != "" {
@@ -904,7 +957,7 @@ func buildDirectTransport() *http.Transport {
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       90 * time.Second,
+		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
@@ -924,7 +977,7 @@ func buildProxyTransport(rawURL string) (*http.Transport, error) {
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          64,
 		MaxIdleConnsPerHost:   16,
-		IdleConnTimeout:       90 * time.Second,
+		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
