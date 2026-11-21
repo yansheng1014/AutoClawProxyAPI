@@ -959,6 +959,7 @@ func buildDirectTransport() *http.Transport {
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 40 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 }
@@ -973,12 +974,16 @@ func buildProxyTransport(rawURL string) (*http.Transport, error) {
 		KeepAlive: 30 * time.Second,
 	}
 	tr := &http.Transport{
-		DialContext:           d.DialContext,
-		ForceAttemptHTTP2:     true,
+		DialContext:       d.DialContext,
+		// 家庭宽带/中转类节点在长连接上跑 HTTP/2 极易出现 PROTOCOL_ERROR /
+		// stream reset（日志里大量 "stream ID x; PROTOCOL_ERROR"），
+		// 改用 HTTP/1.1 分块传输，单请求独占连接，对丢包与中间设备更耐受。
+		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          64,
 		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 40 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	switch strings.ToLower(u.Scheme) {

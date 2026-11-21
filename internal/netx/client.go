@@ -103,6 +103,7 @@ func buildTransport(proxyStr string) (*http.Transport, error) {
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 40 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	if proxyStr == "" {
@@ -113,6 +114,8 @@ func buildTransport(proxyStr string) (*http.Transport, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 经代理（尤其家宽/中转节点）时关闭 HTTP/2，避免长流式响应触发 PROTOCOL_ERROR / stream reset
+	tr.ForceAttemptHTTP2 = false
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":
 		tr.Proxy = http.ProxyURL(u)

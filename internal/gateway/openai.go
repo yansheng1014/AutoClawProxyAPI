@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"autoclaw2api/internal/accounts"
@@ -62,13 +63,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if meta.Stream {
-		resp, usedAcc, err := s.executeChatStreamWithFailover(r.Context(), meta.Model, rawBody)
+		start := time.Now()
+		resp, prefix, usedAcc, err := s.executeChatStreamWithFailover(r.Context(), meta.Model, rawBody)
+		firstAt := time.Since(start)
 		if err != nil {
 			writeOpenAIUpstreamError(w, err)
 			return
 		}
 		defer func() { _ = resp.Body.Close() }()
-		s.streamOpenAIPassthrough(w, resp.Body, usedAcc)
+		s.streamOpenAIPassthrough(w, prefix, resp.Body, usedAcc)
+		s.logSlowRequest(meta.Model, usedAcc, firstAt, time.Since(start))
 		return
 	}
 
@@ -101,7 +105,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if stream {
-		resp, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody)
+		resp, prefix, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody)
 		if err != nil {
 			writeOpenAIUpstreamError(w, err)
 			return
@@ -116,7 +120,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 		flusher, _ := w.(http.Flusher)
 		conv := translator.NewResponsesStreamConverter(model)
-		scanSSEData(resp.Body, func(data []byte) bool {
+		emit := func(data []byte) bool {
 			for _, frame := range conv.ProcessSSEData(data) {
 				if _, err := w.Write(frame); err != nil {
 					return false
@@ -126,7 +130,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 				flusher.Flush()
 			}
 			return true
-		})
+		}
+		watched := withWatchdog(io.MultiReader(bytes.NewReader(prefix), resp.Body), resp.Body)
+		defer watched.Stop()
+		scanSSEData(watched.reader, emit)
 		for _, frame := range conv.Finish() {
 			_, _ = w.Write(frame)
 		}
@@ -151,7 +158,36 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(converted)
 }
 
-func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, body io.Reader, _ *accounts.Account) {
+// watchedStream 在读取上游流的过程中维护空闲看门狗。
+type watchedStream struct {
+	reader io.Reader
+	stop   func()
+}
+
+// Stop 结束看门狗。
+func (w *watchedStream) Stop() { w.stop() }
+
+type watchdogReader struct {
+	r  io.Reader
+	wd *streamWatchdog
+}
+
+func (r *watchdogReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.wd.Touch()
+	}
+	return n, err
+}
+
+// withWatchdog 包装上游响应体：超过 streamIdleTimeout 没有新数据就关闭连接，
+// 让阻塞中的读立即返回，避免客户端无限期等待（表现为“卡住几分钟”）。
+func withWatchdog(r io.Reader, closer io.Closer) *watchedStream {
+	wd := newStreamWatchdog(streamIdleTimeout, func() { _ = closer.Close() })
+	return &watchedStream{reader: &watchdogReader{r: r, wd: wd}, stop: wd.Stop}
+}
+
+func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, prefix []byte, body io.ReadCloser, _ *accounts.Account) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -159,7 +195,10 @@ func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, body io.Reader, 
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
-	reader := bufio.NewReaderSize(body, 32*1024)
+	stream := io.MultiReader(bytes.NewReader(prefix), body)
+	watched := withWatchdog(stream, body)
+	defer watched.Stop()
+	reader := bufio.NewReaderSize(watched.reader, 32*1024)
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
@@ -256,11 +295,52 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 	return nil, nil, lastErr
 }
 
+// 流式响应的看门狗参数：
+//   - firstChunkTimeout：上游返回 200 后迟迟不出第一个数据块，视为该出口不可用，直接切号重试
+//   - streamIdleTimeout：流式过程中长时间没有新数据（上游卡死/连接被中间设备黑洞），主动断开
+const (
+	firstChunkTimeout = 45 * time.Second
+	streamIdleTimeout = 90 * time.Second
+)
+
+// errFirstChunkTimeout 表示等待上游首包超时。
+var errFirstChunkTimeout = errors.New("等待上游首包超时")
+
+// readFirstChunk 在 d 时间内读取上游响应的第一个数据块。
+// 超时返回 errFirstChunkTimeout；调用方应先关闭 resp.Body 以解除阻塞中的读。
+func readFirstChunk(r io.Reader, d time.Duration) ([]byte, error) {
+	type result struct {
+		buf []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		n, err := r.Read(buf)
+		ch <- result{buf[:n], err}
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case res := <-ch:
+		if len(res.buf) > 0 {
+			return append([]byte(nil), res.buf...), nil
+		}
+		if res.err != nil {
+			return nil, res.err
+		}
+		return nil, io.EOF
+	case <-timer.C:
+		return nil, errFirstChunkTimeout
+	}
+}
+
 // executeChatStreamWithFailover 执行带自动切号故障转移的流式 SSE 请求。
-func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedModel string, chatBody []byte) (*http.Response, *accounts.Account, error) {
+// 返回的 prefix 是已经从上游读出的首个数据块，调用方需要在写响应头后先写它。
+func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedModel string, chatBody []byte) (*http.Response, []byte, *accounts.Account, error) {
 	targets, err := s.router.ResolveTargets(requestedModel)
 	if err != nil {
-		return nil, nil, &protocol.UpstreamError{
+		return nil, nil, nil, &protocol.UpstreamError{
 			HTTPStatus: http.StatusBadRequest,
 			Kind:       protocol.ErrorKindClient,
 			Message:    err.Error(),
@@ -276,9 +356,9 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 		acc, target, ok := s.pickNextAccount(targets, triedAccounts)
 		if !ok {
 			if lastErr != nil {
-				return nil, nil, lastErr
+				return nil, nil, nil, lastErr
 			}
-			return nil, nil, &protocol.UpstreamError{
+			return nil, nil, nil, &protocol.UpstreamError{
 				HTTPStatus: http.StatusServiceUnavailable,
 				Kind:       protocol.ErrorKindTransient,
 				Message:    fmt.Sprintf("模型 %s 暂无可用就绪账号（请检查账号池状态或稍后重试）", requestedModel),
@@ -306,8 +386,27 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 			Body:    chatBody,
 		})
 		if errCall == nil {
-			s.pool.ReportSuccess(acc.ID)
-			return resp, acc, nil
+			// 真正成功要等「第一个数据块」到达：上游可能已返回 200 却长时间不出字
+			prefix, errFirst := readFirstChunk(resp.Body, firstChunkTimeout)
+			if errFirst == nil {
+				s.pool.ReportSuccess(acc.ID)
+				return resp, prefix, acc, nil
+			}
+			_ = resp.Body.Close()
+			lastErr = &protocol.UpstreamError{
+				Kind:    protocol.ErrorKindTransient,
+				Message: fmt.Sprintf("上游首包未到达（%v）", errFirst),
+			}
+			s.pool.ReportError(acc.ID, lastErr.(*protocol.UpstreamError))
+			if s.logger != nil {
+				s.logger.Warn("Gateway", "账号 [%s] (%s) 模型 %s 首包超时/中断，自动切号: %v",
+					acc.Cred.DisplayLabel(), target.Region, target.UpstreamModel, errFirst)
+			}
+			if attempt+1 < maxAttempts {
+				// 已经等过一轮首包超时，直接切号不再叠加退避
+				continue
+			}
+			return nil, nil, nil, lastErr
 		}
 
 		lastErr = errCall
@@ -319,20 +418,91 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 					acc.Cred.DisplayLabel(), target.Region, target.UpstreamModel, uerr.Kind, uerr.Message)
 			}
 			if !uerr.ShouldFailover() {
-				return nil, nil, uerr
+				return nil, nil, nil, uerr
 			}
 			if attempt+1 < maxAttempts {
 				if uerr.Kind == protocol.ErrorKindTransient {
 					if !sleepWithContext(ctx, calcBackoff(attempt, retryCfg, uerr.RetryAfter)) {
-						return nil, nil, ctx.Err()
+						return nil, nil, nil, ctx.Err()
 					}
 				}
 				continue
 			}
 		}
-		return nil, nil, lastErr
+		return nil, nil, nil, lastErr
 	}
-	return nil, nil, lastErr
+	return nil, nil, nil, lastErr
+}
+
+// logSlowRequest 只对慢请求打印分段耗时，便于定位卡在「路由/连接/首包/流式」哪个环节。
+func (s *Server) logSlowRequest(model string, acc *accounts.Account, firstChunk, total time.Duration) {
+	if s.logger == nil || total < 5*time.Second {
+		return
+	}
+	label := "unknown"
+	if acc != nil {
+		label = acc.Cred.DisplayLabel()
+	}
+	s.logger.Warn("Perf", "慢请求 model=%s 账号=[%s] 首包=%dms 总耗时=%dms 流式=%dms",
+		model, label, firstChunk.Milliseconds(), total.Milliseconds(),
+		(total - firstChunk).Milliseconds())
+}
+
+// streamWatchdog 在流式传输过程中监控「多久没有新数据」，
+// 超过阈值就主动关闭上游连接，避免客户端无限期挂起。
+type streamWatchdog struct {
+	mu      sync.Mutex
+	last    time.Time
+	stopped bool
+	stopCh  chan struct{}
+}
+
+func newStreamWatchdog(idle time.Duration, onIdle func()) *streamWatchdog {
+	w := &streamWatchdog{last: time.Now(), stopCh: make(chan struct{})}
+	interval := idle / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-w.stopCh:
+				return
+			case <-t.C:
+				w.mu.Lock()
+				idleFor := time.Since(w.last)
+				stopped := w.stopped
+				w.mu.Unlock()
+				if stopped {
+					return
+				}
+				if idleFor >= idle {
+					onIdle()
+					return
+				}
+			}
+		}
+	}()
+	return w
+}
+
+// Touch 记录一次数据到达。
+func (w *streamWatchdog) Touch() {
+	w.mu.Lock()
+	w.last = time.Now()
+	w.mu.Unlock()
+}
+
+// Stop 结束监控。
+func (w *streamWatchdog) Stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.stopped {
+		w.stopped = true
+		close(w.stopCh)
+	}
 }
 
 func (s *Server) pickNextAccount(targets []accounts.RouteTarget, exclude map[string]bool) (*accounts.Account, accounts.RouteTarget, bool) {

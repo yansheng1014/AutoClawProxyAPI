@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net/http"
@@ -28,7 +29,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	if stream {
-		resp, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody)
+		resp, prefix, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody)
 		if err != nil {
 			writeAnthropicUpstreamError(w, err)
 			return
@@ -43,7 +44,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 		flusher, _ := w.(http.Flusher)
 		conv := translator.NewAnthropicStreamConverter(model)
-		scanSSEData(resp.Body, func(data []byte) bool {
+		emit := func(data []byte) bool {
 			for _, frame := range conv.ProcessSSEData(data) {
 				if _, err := w.Write(frame); err != nil {
 					return false
@@ -53,7 +54,11 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 				flusher.Flush()
 			}
 			return true
-		})
+		}
+		// 建立连接阶段已读出首个数据块，与剩余流合并后再按行解析
+		watched := withWatchdog(io.MultiReader(bytes.NewReader(prefix), resp.Body), resp.Body)
+		defer watched.Stop()
+		scanSSEData(watched.reader, emit)
 		for _, frame := range conv.Finish() {
 			_, _ = w.Write(frame)
 		}
