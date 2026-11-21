@@ -219,7 +219,8 @@ func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, prefix []byte, b
 	started := time.Now()
 	watched := withWatchdogCallback(stream, body, func() {
 		if s.logger != nil {
-			s.logger.Warn("Gateway", "上游流式静默超过 %s，主动断开连接（已持续 %s）", streamIdleTimeout, time.Since(started).Round(time.Second))
+			s.logger.Warn("Gateway", "上游流式静默超过 %s，主动断开（出口=[%s] 已持续 %s）",
+				streamIdleTimeout, s.routeLabel(acc), time.Since(started).Round(time.Second))
 		}
 	})
 	defer watched.Stop()
@@ -250,15 +251,9 @@ func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, prefix []byte, b
 					flusher.Flush()
 				}
 			}
-			if !normalEnd {
-				label := "unknown"
-				if acc != nil {
-					label = acc.Cred.DisplayLabel()
-				}
-				if s.logger != nil {
-					s.logger.Warn("Gateway", "上游流式异常结束（无 finish_reason/DONE）账号=[%s] 已持续=%s 原因=%v",
-						label, time.Since(started).Round(time.Millisecond), err)
-				}
+			if !normalEnd && s.logger != nil {
+				s.logger.Warn("Gateway", "上游流式异常结束（无 finish_reason/DONE）出口=[%s] 已持续=%s 原因=%v",
+					s.routeLabel(acc), time.Since(started).Round(time.Millisecond), err)
 			}
 			return
 		}
@@ -452,8 +447,8 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 			}
 			s.pool.ReportError(acc.ID, lastErr.(*protocol.UpstreamError))
 			if s.logger != nil {
-				s.logger.Warn("Gateway", "账号 [%s] (%s) 模型 %s 首包超时/中断，自动切号: %v",
-					acc.Cred.DisplayLabel(), target.Region, target.UpstreamModel, errFirst)
+				s.logger.Warn("Gateway", "模型 %s 首包超时/中断，自动切号（出口=[%s] 区域=%s）: %v",
+					target.UpstreamModel, s.routeLabel(acc), target.Region, errFirst)
 			}
 			if attempt+1 < maxAttempts {
 				// 已经等过一轮首包超时，直接切号不再叠加退避
@@ -487,17 +482,31 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 	return nil, nil, nil, lastErr
 }
 
+// routeLabel 返回账号当前生效的出口节点描述，用于日志归因（能直接看出是不是某个节点的问题）。
+func (s *Server) routeLabel(acc *accounts.Account) string {
+	if acc == nil {
+		return "unknown"
+	}
+	region := string(protocol.NormalizeRegion(string(acc.Cred.Region)))
+	info := s.proxyMgr.DescribeAccountRoute(acc.ID, region)
+	name := info.NodeName
+	if name == "" {
+		if info.EffectiveMode == "direct" {
+			name = "直连"
+		} else {
+			name = "未知出口"
+		}
+	}
+	return fmt.Sprintf("%s/%s", acc.Cred.DisplayLabel(), name)
+}
+
 // logSlowRequest 只对慢请求打印分段耗时，便于定位卡在「路由/连接/首包/流式」哪个环节。
 func (s *Server) logSlowRequest(model string, acc *accounts.Account, firstChunk, total time.Duration) {
 	if s.logger == nil || total < 5*time.Second {
 		return
 	}
-	label := "unknown"
-	if acc != nil {
-		label = acc.Cred.DisplayLabel()
-	}
-	s.logger.Warn("Perf", "慢请求 model=%s 账号=[%s] 首包=%dms 总耗时=%dms 流式=%dms",
-		model, label, firstChunk.Milliseconds(), total.Milliseconds(),
+	s.logger.Warn("Perf", "慢请求 model=%s 出口=[%s] 首包=%dms 总耗时=%dms 流式=%dms",
+		model, s.routeLabel(acc), firstChunk.Milliseconds(), total.Milliseconds(),
 		(total - firstChunk).Milliseconds())
 }
 

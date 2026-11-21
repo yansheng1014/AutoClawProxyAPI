@@ -881,6 +881,7 @@ func (m *Manager) recordProbeResult(id string, ok bool, latencyMS int64, errMsg 
 		h = &nodeHealth{}
 		m.health[id] = h
 	}
+	prevStatus := h.Status
 	h.Checking = false
 	h.CheckedAt = time.Now()
 	h.LatencyMS = latencyMS
@@ -890,6 +891,23 @@ func (m *Manager) recordProbeResult(id string, ok bool, latencyMS int64, errMsg 
 	} else {
 		h.Status = StatusUnhealthy
 		h.LastError = errMsg
+	}
+
+	// 状态翻转时打点：事后可直接从日志里看出「某个节点在什么时刻开始不稳」，
+	// 用于区分是代理节点的问题还是上游/链路的问题。
+	if m.logger != nil && prevStatus != h.Status {
+		name := id
+		if n, found := m.findNodeLocked(id); found {
+			name = n.Name
+		}
+		switch h.Status {
+		case StatusUnhealthy:
+			m.logger.Warn("ProxyPool", "节点「%s」测活失败被摘除（延迟 %dms）：%s", name, latencyMS, errMsg)
+		case StatusHealthy:
+			if prevStatus != "" && prevStatus != StatusUnknown {
+				m.logger.Info("ProxyPool", "节点「%s」恢复健康（延迟 %dms）", name, latencyMS)
+			}
+		}
 	}
 }
 
