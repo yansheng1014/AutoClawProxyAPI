@@ -62,9 +62,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	reqCtx := withStickyKey(r.Context(), extractStickyKey(rawBody))
 	if meta.Stream {
 		start := time.Now()
-		resp, prefix, usedAcc, err := s.executeChatStreamWithFailover(r.Context(), meta.Model, rawBody)
+		resp, prefix, usedAcc, err := s.executeChatStreamWithFailover(reqCtx, meta.Model, rawBody)
 		firstAt := time.Since(start)
 		if err != nil {
 			writeOpenAIUpstreamError(w, err)
@@ -76,7 +77,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, _, err := s.executeChatWithFailover(r.Context(), meta.Model, rawBody)
+	payload, _, err := s.executeChatWithFailover(reqCtx, meta.Model, rawBody)
 	if err != nil {
 		writeOpenAIUpstreamError(w, err)
 		return
@@ -104,8 +105,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	reqCtx := withStickyKey(r.Context(), extractStickyKey(rawBody))
 	if stream {
-		resp, prefix, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody)
+		resp, prefix, _, err := s.executeChatStreamWithFailover(reqCtx, model, chatBody)
 		if err != nil {
 			writeOpenAIUpstreamError(w, err)
 			return
@@ -153,7 +155,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, _, err := s.executeChatWithFailover(r.Context(), model, chatBody)
+	payload, _, err := s.executeChatWithFailover(reqCtx, model, chatBody)
 	if err != nil {
 		writeOpenAIUpstreamError(w, err)
 		return
@@ -278,7 +280,7 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		acc, target, ok := s.pickNextAccount(targets, triedAccounts)
+		acc, target, ok := s.pickNextAccount(ctx, targets, triedAccounts)
 		if !ok {
 			if lastErr != nil {
 				return nil, nil, lastErr
@@ -319,6 +321,8 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 		var uerr *protocol.UpstreamError
 		if errors.As(errCall, &uerr) {
 			s.pool.ReportError(acc.ID, uerr)
+			// 该账号已不可用（限流/余额/失效），解除其会话绑定，让下次请求重新选号
+			s.sticky.DropAccount(acc.ID)
 			if s.logger != nil {
 				s.logger.Warn("Gateway", "调用模型 %s 失败 [%s] 出口=[%s] 区域=%s: %s",
 					target.UpstreamModel, uerr.Kind, s.routeLabel(acc), target.Region, uerr.Message)
@@ -409,7 +413,7 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		acc, target, ok := s.pickNextAccount(targets, triedAccounts)
+		acc, target, ok := s.pickNextAccount(ctx, targets, triedAccounts)
 		if !ok {
 			if lastErr != nil {
 				return nil, nil, nil, lastErr
@@ -469,6 +473,8 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 		var uerr *protocol.UpstreamError
 		if errors.As(errCall, &uerr) {
 			s.pool.ReportError(acc.ID, uerr)
+			// 该账号已不可用（限流/余额/失效），解除其会话绑定，让下次请求重新选号
+			s.sticky.DropAccount(acc.ID)
 			if s.logger != nil {
 				s.logger.Warn("Gateway", "流式调用模型 %s 失败 [%s] 出口=[%s] 区域=%s: %s",
 					target.UpstreamModel, uerr.Kind, s.routeLabel(acc), target.Region, uerr.Message)
@@ -583,9 +589,26 @@ func (w *streamWatchdog) Stop() {
 	}
 }
 
-func (s *Server) pickNextAccount(targets []accounts.RouteTarget, exclude map[string]bool) (*accounts.Account, accounts.RouteTarget, bool) {
+// pickNextAccount 选择下一个可用账号。
+// 若该会话已绑定某账号且该账号仍在线，则优先复用它（提升 Prompt Cache 命中率）；
+// 未绑定或绑定账号不可用时回落到常规轮询，并记录新的绑定。
+func (s *Server) pickNextAccount(ctx context.Context, targets []accounts.RouteTarget, exclude map[string]bool) (*accounts.Account, accounts.RouteTarget, bool) {
+	stickyKey := stickyKeyFrom(ctx)
+	if stickyKey != "" {
+		if id, ok := s.sticky.Lookup(stickyKey); ok {
+			for _, target := range targets {
+				if acc, ok := s.pool.AcquireExact(id, target.Region, exclude); ok {
+					s.sticky.Bind(stickyKey, acc.ID)
+					return acc, target, true
+				}
+			}
+		}
+	}
 	for _, target := range targets {
 		if acc, ok := s.pool.Acquire(target.Region, exclude); ok {
+			if stickyKey != "" {
+				s.sticky.Bind(stickyKey, acc.ID)
+			}
 			return acc, target, true
 		}
 	}

@@ -153,10 +153,12 @@ func (e *Engine) Start(ctx context.Context) {
 		syncTicker := time.NewTicker(30 * time.Second)
 		refreshTicker := time.NewTicker(15 * time.Minute)
 		modelTicker := time.NewTicker(30 * time.Minute)
+		balanceTicker := time.NewTicker(30 * time.Minute)
 		warmTicker := time.NewTicker(45 * time.Second)
 		defer syncTicker.Stop()
 		defer refreshTicker.Stop()
 		defer modelTicker.Stop()
+		defer balanceTicker.Stop()
 		defer warmTicker.Stop()
 
 		for {
@@ -175,6 +177,13 @@ func (e *Engine) Start(ctx context.Context) {
 				e.keepWarmTransports(ctx)
 			case <-refreshTicker.C:
 				e.refreshExpiringTokens(ctx)
+			case <-balanceTicker.C:
+				// 后台轻量巡检余额（无可用账号时直接跳过，避免无谓的上游请求）
+				if e.pool.Stats().ReadyTotal > 0 {
+					balCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+					e.RefreshAllBalances(balCtx)
+					cancel()
+				}
 			case <-modelTicker.C:
 				probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				_ = e.router.RefreshAllModels(probeCtx)
@@ -457,7 +466,8 @@ func (e *Engine) RefreshAccountBalance(ctx context.Context, id string) (float64,
 func (e *Engine) RefreshAllBalances(ctx context.Context) int {
 	list := e.pool.AllAccounts()
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 6)
+	// 并发度收敛到 2：同出口 IP 多号并发查询余额容易触发上游风控
+	sem := make(chan struct{}, 2)
 	var mu sync.Mutex
 	okCount := 0
 

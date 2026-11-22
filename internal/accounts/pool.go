@@ -62,29 +62,29 @@ func (a *Account) EffectiveStatus(now time.Time) Status {
 
 // AccountView 是面向 Web 控制台与状态查询的脱敏视图结构。
 type AccountView struct {
-	ID              string          `json:"id"`
-	FileName        string          `json:"file_name"`
-	Label           string          `json:"label"`
-	Alias           string          `json:"alias"`
-	UserName        string          `json:"user_name"`
-	UserID          string          `json:"user_id"`
-	Phone           string          `json:"phone"`
-	Note            string          `json:"note"`
-	Region          protocol.Region `json:"region"`
-	Channel         string          `json:"channel"`
-	Status          Status          `json:"status"`
-	Disabled        bool            `json:"disabled"`
-	SessionDead     bool            `json:"session_dead"`
-	CooldownRemainS int64           `json:"cooldown_remain_sec"`
-	CooldownKind    string          `json:"cooldown_kind,omitempty"`
-	LastError       string          `json:"last_error,omitempty"`
-	ExpiresAt       int64           `json:"expires_at"`
-	TokenMasked     string          `json:"token_masked"`
-	Balance         float64         `json:"balance"`
-	BalanceKnown    bool            `json:"balance_known"`
-	BalanceAt       string          `json:"balance_at,omitempty"`
-	CheckedInToday  bool            `json:"checked_in_today"`
-	CheckinStatus   string          `json:"checkin_status"`
+	ID              string               `json:"id"`
+	FileName        string               `json:"file_name"`
+	Label           string               `json:"label"`
+	Alias           string               `json:"alias"`
+	UserName        string               `json:"user_name"`
+	UserID          string               `json:"user_id"`
+	Phone           string               `json:"phone"`
+	Note            string               `json:"note"`
+	Region          protocol.Region      `json:"region"`
+	Channel         string               `json:"channel"`
+	Status          Status               `json:"status"`
+	Disabled        bool                 `json:"disabled"`
+	SessionDead     bool                 `json:"session_dead"`
+	CooldownRemainS int64                `json:"cooldown_remain_sec"`
+	CooldownKind    string               `json:"cooldown_kind,omitempty"`
+	LastError       string               `json:"last_error,omitempty"`
+	ExpiresAt       int64                `json:"expires_at"`
+	TokenMasked     string               `json:"token_masked"`
+	Balance         float64              `json:"balance"`
+	BalanceKnown    bool                 `json:"balance_known"`
+	BalanceAt       string               `json:"balance_at,omitempty"`
+	CheckedInToday  bool                 `json:"checked_in_today"`
+	CheckinStatus   string               `json:"checkin_status"`
 	CheckinMsg      string               `json:"checkin_msg,omitempty"`
 	TotalRequests   int64                `json:"total_requests"`
 	FailedCount     int64                `json:"failed_count"`
@@ -231,6 +231,30 @@ func (p *Pool) rebuildOrderLocked() {
 }
 
 // Acquire 按轮询策略选择一个可用的就绪账号（region 为空表示双区联合调度，exclude 用于单请求故障切号避让）。
+// AcquireExact 尝试取用指定账号（用于会话粘性命中）。
+// 账号需存在、未被排除、区域匹配且在线，否则返回 false，由调用方回落到常规轮询。
+func (p *Pool) AcquireExact(id string, region protocol.Region, exclude map[string]bool) (*Account, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if exclude != nil && exclude[id] {
+		return nil, false
+	}
+	acc, ok := p.items[id]
+	if !ok {
+		return nil, false
+	}
+	if region != "" && acc.Cred.Region != region {
+		return nil, false
+	}
+	if acc.EffectiveStatus(time.Now()) != StatusOnline {
+		return nil, false
+	}
+	acc.TotalRequests++
+	snap := *acc
+	return &snap, true
+}
+
 func (p *Pool) Acquire(region protocol.Region, exclude map[string]bool) (*Account, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

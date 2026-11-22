@@ -41,6 +41,9 @@ type Server struct {
 
 	sessionMu     sync.RWMutex
 	panelSessions map[string]panelSession
+
+	// sticky 维护「会话 -> 账号」的短时绑定，用于提升上游 Prompt Cache 命中率
+	sticky *accounts.StickyBinder
 }
 
 // NewServer 构造网关服务实例。
@@ -62,6 +65,7 @@ func NewServer(
 		startedAt:     time.Now(),
 		oauthSessions: make(map[string]oauthSession),
 		panelSessions: make(map[string]panelSession),
+		sticky:        accounts.NewStickyBinder(),
 	}
 }
 
