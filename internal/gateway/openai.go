@@ -274,6 +274,7 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 	retryCfg := s.cfgMgr.Get().Retry
 	maxAttempts := max(1, retryCfg.MaxRetries+1)
 	triedAccounts := make(map[string]bool)
+	timeoutRetries := 0
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -319,8 +320,14 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 		if errors.As(errCall, &uerr) {
 			s.pool.ReportError(acc.ID, uerr)
 			if s.logger != nil {
-				s.logger.Warn("Gateway", "账号 [%s] (%s) 调用模型 %s 失败 [%s]: %s",
-					acc.Cred.DisplayLabel(), target.Region, target.UpstreamModel, uerr.Kind, uerr.Message)
+				s.logger.Warn("Gateway", "调用模型 %s 失败 [%s] 出口=[%s] 区域=%s: %s",
+					target.UpstreamModel, uerr.Kind, s.routeLabel(acc), target.Region, uerr.Message)
+			}
+			if uerr.HTTPStatus == http.StatusGatewayTimeout {
+				timeoutRetries++
+				if timeoutRetries >= 2 {
+					return nil, nil, uerr
+				}
 			}
 			if !uerr.ShouldFailover() {
 				return nil, nil, uerr
@@ -398,6 +405,7 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 	retryCfg := s.cfgMgr.Get().Retry
 	maxAttempts := max(1, retryCfg.MaxRetries+1)
 	triedAccounts := make(map[string]bool)
+	timeoutRetries := 0
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -462,8 +470,16 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 		if errors.As(errCall, &uerr) {
 			s.pool.ReportError(acc.ID, uerr)
 			if s.logger != nil {
-				s.logger.Warn("Gateway", "账号 [%s] (%s) 流式调用模型 %s 失败 [%s]: %s",
-					acc.Cred.DisplayLabel(), target.Region, target.UpstreamModel, uerr.Kind, uerr.Message)
+				s.logger.Warn("Gateway", "流式调用模型 %s 失败 [%s] 出口=[%s] 区域=%s: %s",
+					target.UpstreamModel, uerr.Kind, s.routeLabel(acc), target.Region, uerr.Message)
+			}
+			// 上游排队/过载导致的超时是全局性的，换账号基本无效，
+			// 最多多试一个账号就快速失败，避免把一次请求拖成几分钟。
+			if uerr.HTTPStatus == http.StatusGatewayTimeout {
+				timeoutRetries++
+				if timeoutRetries >= 2 {
+					return nil, nil, nil, uerr
+				}
 			}
 			if !uerr.ShouldFailover() {
 				return nil, nil, nil, uerr

@@ -1,8 +1,11 @@
 package protocol
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -222,4 +225,29 @@ func truncateText(s string, maxRunes int) string {
 		return s
 	}
 	return string(runes[:maxRunes]) + "..."
+}
+
+// IsTransportTimeout 判断错误是否为网络层超时（含响应头等待超时、连接/读写超时）。
+// 这类错误通常意味着上游排队或链路拥塞，换账号重试往往无效，应快速失败并提示换模型。
+func IsTransportTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "timeout awaiting response headers")
+}
+
+// NewTransportTimeoutError 构造上游超时错误（HTTP 504，语义比 502 更准确）。
+func NewTransportTimeoutError(prefix string, err error) *UpstreamError {
+	return &UpstreamError{
+		HTTPStatus: http.StatusGatewayTimeout,
+		Kind:       ErrorKindTransient,
+		Message:    prefix + "：上游迟迟未返回响应头（模型排队或过载），建议更换模型或稍后重试（" + err.Error() + "）",
+	}
 }

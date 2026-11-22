@@ -977,7 +977,7 @@ func buildDirectTransport() *http.Transport {
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 40 * time.Second,
+		ResponseHeaderTimeout: 75 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 }
@@ -1001,7 +1001,7 @@ func buildProxyTransport(rawURL string) (*http.Transport, error) {
 		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 40 * time.Second,
+		ResponseHeaderTimeout: 75 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	switch strings.ToLower(u.Scheme) {

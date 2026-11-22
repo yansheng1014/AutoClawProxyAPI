@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"autoclaw2api/internal/protocol"
 )
 
 // TestStreamPassthroughAbnormalEnd 验证：上游连接中途被掐断（无 finish_reason）时，
@@ -71,5 +73,25 @@ func TestStreamPassthroughIdleWatchdog(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "stream_interrupted") {
 		t.Fatalf("静默超时应补发错误事件，实际: %s", body)
+	}
+}
+
+// TestUpstreamTimeoutMapsTo504 验证：上游等待响应头超时要以 504 返回，
+// 并且错误文案直接告诉调用方「换模型或稍后重试」，而不是含糊的 502 transient。
+func TestUpstreamTimeoutMapsTo504(t *testing.T) {
+	rec := httptest.NewRecorder()
+	err := protocol.NewTransportTimeoutError("请求上游流式接口超时",
+		errors.New("net/http: timeout awaiting response headers"))
+
+	writeOpenAIUpstreamError(rec, err)
+
+	if rec.Code != 504 {
+		t.Fatalf("期望 504，实际 %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"建议更换模型", "transient"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("响应缺少 %q：%s", want, body)
+		}
 	}
 }

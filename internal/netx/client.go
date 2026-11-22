@@ -103,7 +103,7 @@ func buildTransport(proxyStr string) (*http.Transport, error) {
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 40 * time.Second,
+		ResponseHeaderTimeout: 75 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	if proxyStr == "" {

@@ -35,6 +35,9 @@ func ChatCompletion(ctx context.Context, client *http.Client, req ChatRequest) (
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		if IsTransportTimeout(err) {
+			return nil, NewTransportTimeoutError("请求上游对话接口超时", err)
+		}
 		return nil, &UpstreamError{
 			Kind:    ErrorKindTransient,
 			Message: "请求上游对话接口失败: " + err.Error(),
@@ -77,6 +80,9 @@ func ChatCompletionStream(ctx context.Context, client *http.Client, req ChatRequ
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		if IsTransportTimeout(err) {
+			return nil, NewTransportTimeoutError("请求上游流式接口超时", err)
+		}
 		return nil, &UpstreamError{
 			Kind:    ErrorKindTransient,
 			Message: "请求上游流式接口失败: " + err.Error(),
