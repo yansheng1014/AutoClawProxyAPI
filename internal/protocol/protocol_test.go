@@ -32,8 +32,17 @@ func TestThreeHeaderSetsIsolated(t *testing.T) {
 	if reqChat.Header.Get("X-Request-Model") != "glm-5.3-flash" {
 		t.Fatalf("对话头缺少 X-Request-Model")
 	}
-	if reqChat.Header.Get("x_trace_id") != "autoclaw2api" {
-		t.Fatalf("对话头 x_trace_id 应为 autoclaw2api，实际: %s", reqChat.Header.Get("x_trace_id"))
+	// 风控要求：trace 头不得暴露第三方工具名，且两个 trace 头应为同一个随机值
+	traceUpper := reqChat.Header.Get("X-Trace-Id")
+	traceLower := reqChat.Header.Get("x_trace_id")
+	if traceUpper == "" || traceUpper != traceLower {
+		t.Fatalf("两个 trace 头应为同一随机值，实际 X-Trace-Id=%q x_trace_id=%q", traceUpper, traceLower)
+	}
+	if len(traceUpper) != 16 {
+		t.Fatalf("trace 头应为 16 位十六进制，实际 %q", traceUpper)
+	}
+	if strings.Contains(strings.ToLower(traceUpper), "autoclaw") {
+		t.Fatalf("trace 头不得包含项目名，实际 %q", traceUpper)
 	}
 	if reqChat.Header.Get("X-Auth-Sign") != "" {
 		t.Fatalf("对话头不应混入 UserAPI 签名头")
@@ -170,5 +179,44 @@ func TestParseOAuthCallbackURL(t *testing.T) {
 	_, _, _, okBad := ParseOAuthCallbackURL("https://evil.example.com/auth/callback-google?code=123")
 	if okBad {
 		t.Fatalf("非回环域名回调应被拒绝")
+	}
+}
+
+// TestEnsureStreamUsageDefaults 验证流式请求会默认补齐 include_usage，
+// 但客户端显式设置时不覆盖。
+func TestEnsureStreamUsageDefaults(t *testing.T) {
+	// 未显式声明 -> 自动补 true
+	in := []byte(`{"model":"m","stream":true,"messages":[]}`)
+	out := PrepareOutboundChatBody(in, "m")
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	opts, _ := got["stream_options"].(map[string]any)
+	if opts == nil || opts["include_usage"] != true {
+		t.Fatalf("流式请求应默认补齐 include_usage=true，实际 %+v", got["stream_options"])
+	}
+
+	// 显式 false -> 尊重客户端
+	in2 := []byte(`{"model":"m","stream":true,"stream_options":{"include_usage":false},"messages":[]}`)
+	out2 := PrepareOutboundChatBody(in2, "m")
+	var got2 map[string]any
+	if err := json.Unmarshal(out2, &got2); err != nil {
+		t.Fatal(err)
+	}
+	opts2, _ := got2["stream_options"].(map[string]any)
+	if opts2["include_usage"] != false {
+		t.Fatalf("客户端显式设置不应被覆盖，实际 %+v", opts2)
+	}
+
+	// 非流式不注入
+	in3 := []byte(`{"model":"m","messages":[]}`)
+	out3 := PrepareOutboundChatBody(in3, "m")
+	var got3 map[string]any
+	if err := json.Unmarshal(out3, &got3); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := got3["stream_options"]; exists {
+		t.Fatal("非流式请求不应注入 stream_options")
 	}
 }

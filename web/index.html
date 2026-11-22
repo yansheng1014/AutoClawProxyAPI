@@ -1270,6 +1270,13 @@ function formatExpiry(ts){
   const diff = ts - now;
   const d = new Date(ts * 1000).toLocaleDateString('zh-CN');
   if (diff <= 0) return `<span class="err">已过期 (${d})</span>`;
+  // 国际版 accessToken 只有 24h 有效期，按天显示会永远停在「剩 0 天」并误报警告，
+  // 这里不足 1 天按小时显示，且仅在剩余 <= 4 小时时标黄。
+  if (diff < 86400){
+    const hours = Math.max(1, Math.floor(diff / 3600));
+    const cls = diff <= 4 * 3600 ? 'warn' : '';
+    return cls ? `<span class="${cls}">剩 ${hours} 小时</span>` : `<span>剩 ${hours} 小时</span>`;
+  }
   const days = Math.floor(diff / 86400);
   if (days <= 3) return `<span class="warn">剩 ${days} 天 (${d})</span>`;
   return `<span>剩 ${days} 天 (${d})</span>`;

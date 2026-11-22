@@ -330,6 +330,9 @@ func (s *Server) handleAdminOAuthCallback(w http.ResponseWriter, r *http.Request
 
 	data, err := protocol.ExchangeOAuthCode(r.Context(), client, baseURL, provider, code, upstreamState, sess.NavigateURI, sess.DeviceID)
 	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("Admin", "国际版 OAuth 换票失败（provider=%s device=%s）: %v", provider, sess.DeviceID, err)
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}

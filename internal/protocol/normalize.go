@@ -81,6 +81,7 @@ func PrepareOutboundChatBody(rawBody []byte, targetModel string) []byte {
 
 	normalizeMessagesForUpstream(payload)
 	normalizeMaxTokensFloor(payload)
+	ensureStreamUsage(payload)
 
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -238,4 +239,22 @@ func normalizeMaxTokensFloor(payload map[string]any) {
 	if v > 0 && v < MinAllowedMaxTokens && v == float64(int64(v)) {
 		payload["max_tokens"] = float64(MinAllowedMaxTokens)
 	}
+}
+
+// ensureStreamUsage 对 stream:true 的请求补齐 stream_options.include_usage。
+//
+// 上游支持在流式响应末尾回传精确 usage（含 cached_tokens）。若客户端未显式声明，
+// 这里默认补上；客户端已显式设置（无论 true/false）则尊重其选择。
+func ensureStreamUsage(payload map[string]any) {
+	if stream, ok := payload["stream"].(bool); !ok || !stream {
+		return
+	}
+	opts, ok := payload["stream_options"].(map[string]any)
+	if !ok {
+		opts = map[string]any{}
+	}
+	if _, exists := opts["include_usage"]; !exists {
+		opts["include_usage"] = true
+	}
+	payload["stream_options"] = opts
 }

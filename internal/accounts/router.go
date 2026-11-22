@@ -148,14 +148,25 @@ func (r *Router) SyncRegionModels(ctx context.Context, region protocol.Region) (
 	if lastErr != nil {
 		errMsg = lastErr.Error()
 	}
+	// 只有该区域确实没有活跃账号时才清空模型缓存；
+	// 仍有账号在线时保留上一轮成功同步的缓存，避免一次瞬时网络抖动导致 /v1/models 被清空、
+	// 下游误判整条渠道不可用。
+	keepCache := r.hasActiveAccount(region)
 	r.mu.Lock()
-	delete(r.modelsByRegion, region)
+	if !keepCache {
+		delete(r.modelsByRegion, region)
+	}
 	r.lastSyncAt[region] = time.Now()
 	r.lastSyncErr[region] = errMsg
+	cachedCount := len(r.modelsByRegion[region])
 	r.mu.Unlock()
 
 	if r.logger != nil {
-		r.logger.Warn("Router", "实时同步 %s 模型目录失败（不回落静态列表）: %s", region.DisplayName(), errMsg)
+		if keepCache {
+			r.logger.Warn("Router", "实时同步 %s 模型目录失败，沿用上次缓存（%d 个模型）: %s", region.DisplayName(), cachedCount, errMsg)
+		} else {
+			r.logger.Warn("Router", "实时同步 %s 模型目录失败（该区域无活跃账号，已清空）: %s", region.DisplayName(), errMsg)
+		}
 	}
 	return nil, errors.New(errMsg)
 }

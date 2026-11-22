@@ -243,7 +243,7 @@ func ExchangeOAuthCode(ctx context.Context, client *http.Client, baseURL string,
 	}
 	bizCode, msg, data := unpackLoginEnvelope(raw)
 	if bizCode != 0 {
-		return nil, errors.New(explainLoginBizError(true, bizCode, msg))
+		return nil, errors.New(explainOAuthCallbackBizError(bizCode, msg))
 	}
 	return decodeLoginAccount(data, RegionGlobal, deviceID)
 }
@@ -373,6 +373,32 @@ func decodeLoginAccount(data json.RawMessage, region Region, deviceID string) (*
 		UserName:     strings.TrimSpace(payload.UserName),
 		DeviceID:     deviceID,
 	}, nil
+}
+
+// explainOAuthCallbackBizError 解释「换票阶段」（ExchangeOAuthCode）的业务错误。
+//
+// 该阶段不涉及滑块验证，但上游在触发风控/审核失败时同样会返回 630014，
+// 因此不能复用滑块阶段文案，否则会把真实的「审核失败」误报成「滑块未通过」。
+// 所有分支都保留上游原始 code 与 msg，便于排查。
+func explainOAuthCallbackBizError(code int64, upstreamMsg string) string {
+	raw := strings.TrimSpace(upstreamMsg)
+	tail := ""
+	if raw != "" {
+		tail = fmt.Sprintf("（code=%d，%s）", code, raw)
+	} else {
+		tail = fmt.Sprintf("（code=%d）", code)
+	}
+	switch code {
+	case 630014:
+		return "换票阶段被上游风控/审核拦截（常见原因：同一出口 IP 连续登录多个新号、浏览器与换票请求出口 IP 不一致、或该账号审核未通过）" + tail
+	case 631002:
+		return "换票阶段的授权校验未通过，请重新发起授权" + tail
+	case 631001:
+		return "回调授权码无效或已过期，请重新发起授权" + tail
+	case 400002:
+		return "请求签名校验失败（请检查本机系统时间是否准确）" + tail
+	}
+	return "换票失败" + tail
 }
 
 func explainLoginBizError(isOAuth bool, code int64, upstreamMsg string) string {

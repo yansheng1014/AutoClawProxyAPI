@@ -57,7 +57,6 @@ const (
 	AuthSignSecret = "38d2391985e2369a5fb8227d8e6cd5e5"
 	ClientVersion  = "1.18.5"
 	ClientUA       = "AutoClaw/" + ClientVersion
-	TraceTag       = "autoclaw2api"
 
 	BizCodeNotLoggedIn = 410000
 	BizCodeAuthExpired = 400000
@@ -152,7 +151,7 @@ func desktopTM() string {
 }
 
 // AttachChatHeaders 设置对话补全专用请求头（第一套独立请求头）。
-// 携带双通道 Bearer、X-Request-Model、桌面端 mac 指纹与 x_trace_id=autoclaw2api。
+// 携带双通道 Bearer、X-Request-Model 与桌面端 mac 指纹；两个 trace 头复用同一次随机值。
 func AttachChatHeaders(req *http.Request, token, model string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
@@ -163,8 +162,10 @@ func AttachChatHeaders(req *http.Request, token, model string) {
 	req.Header.Set("X-Channel", "official")
 	req.Header.Set("X-Lang", "zh-CN")
 	req.Header.Set("X-Client-Type", "pc")
-	req.Header.Set("X-Trace-Id", RandomHex(16))
-	req.Header.Set("x_trace_id", TraceTag)
+	// 两个 trace 头使用同一个随机串，避免暴露第三方工具特征
+	traceID := RandomHex(16)
+	req.Header.Set("X-Trace-Id", traceID)
+	req.Header.Set("x_trace_id", traceID)
 	if b := formatBearer(token); b != "" {
 		req.Header.Set("Authorization", b)
 		req.Header.Set("X-Authorization", b)
@@ -244,6 +245,18 @@ func JWTExpirySeconds(token string) int64 {
 		return 0
 	}
 	if v, ok := claims["exp"].(float64); ok && v > 0 {
+		return int64(v)
+	}
+	return 0
+}
+
+// JWTIssuedAtSeconds 从 JWT 的 iat 字段读取签发时间，无法解析返回 0。
+func JWTIssuedAtSeconds(token string) int64 {
+	claims := ParseJWTClaims(token)
+	if claims == nil {
+		return 0
+	}
+	if v, ok := claims["iat"].(float64); ok && v > 0 {
 		return int64(v)
 	}
 	return 0

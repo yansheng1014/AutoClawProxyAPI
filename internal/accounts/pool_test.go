@@ -252,13 +252,14 @@ func TestRouterRealtimeSyncAndEmptyWhenNoActiveAccount(t *testing.T) {
 		t.Fatalf("同步后应暴露 2 条记录，实际: %+v", got)
 	}
 
-	// 3. 上游探测失败时，返回明确错误且绝不回落编造静态假模型
+	// 3. 上游探测失败时返回明确错误；但区域仍有活跃账号，
+	//    必须沿用上一轮成功同步的缓存模型，不能因为一次瞬时抖动就清空 /v1/models
 	failUpstream.Store(true)
 	if _, err := router.SyncRegionModels(context.Background(), protocol.RegionCN); err == nil {
 		t.Fatalf("上游探测失败时应返回错误")
 	}
-	if got := router.ListOpenAIModels(); len(got) != 0 {
-		t.Fatalf("探测失败后不应编造或残留假模型，实际: %+v", got)
+	if got := router.ListOpenAIModels(); len(got) != 2 {
+		t.Fatalf("瞬时探测失败应保留上次缓存（2 条），实际: %+v", got)
 	}
 	st := router.SyncStatuses()["cn"]
 	if st.ErrorMessage == "" {
